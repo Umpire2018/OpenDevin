@@ -63,7 +63,36 @@ jobs:
           WORKSPACE_BASE="$GITHUB_WORKSPACE/workspace" \
             WORKSPACE_MOUNT_PATH="$GITHUB_WORKSPACE/workspace" \
             poetry run pytest --cov=agenthub --cov=opendevin --cov-report=xml \
-            -s ./tests/integration
+            -s ./tests/integration -k "not test_sandbox"
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  specific-test:
+    needs: integration-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install poetry via pipx
+        run: pipx install poetry
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'poetry'
+
+      - name: Install Python dependencies using Poetry
+        run: poetry install
+
+      - name: Build Environment
+        run: make build
+
+      - name: Run Specific Integration Test for Sandbox
+        run: |
+          poetry run pytest --cov=agenthub --cov=opendevin --cov-report=xml -s ./tests/integration/test_sandbox.py
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         env:
@@ -71,6 +100,6 @@ jobs:
   test_matrix_success:
     name: All Integration Tests Passed
     runs-on: ubuntu-latest
-    needs: [integration-tests]
+    needs: [integration-tests, specific-test]
     steps:
     - run: echo Done!

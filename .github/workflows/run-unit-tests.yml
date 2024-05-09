@@ -14,6 +14,8 @@ jobs:
   test-on-macos:
     name: Test on macOS
     runs-on: macos-13
+    env:
+      INSTALL_DOCKER: '0'  # Set to '0' to skip Docker installation
     strategy:
       matrix:
         python-version: ["3.11"]
@@ -34,6 +36,7 @@ jobs:
         run: poetry install
 
       - name: Install & Start Docker
+        if: env.INSTALL_DOCKER == '1'
         run: |
           brew install colima docker
           colima start
@@ -55,6 +58,8 @@ jobs:
   test-on-linux:
     name: Test on Linux
     runs-on: ubuntu-latest
+    env:
+      INSTALL_DOCKER: '0'  # Set to '0' to skip Docker installation
     strategy:
       matrix:
         python-version: ["3.11"]
