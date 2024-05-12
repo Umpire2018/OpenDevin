@@ -1,3 +1,4 @@
+# File: .github/workflows/run-integration-tests.yml
 name: Run Integration Tests
 
 concurrency:
@@ -24,7 +25,6 @@ jobs:
           - agent: "MonologueAgent"
             embedding-model: "local"
           - agent: "MonologueAgent"
-            # sufficient to have one agent testing against local sandbox
             sandbox: "local"
             embedding-model: "local"
           - agent: "SWEAgent"
@@ -34,23 +34,12 @@ jobs:
           - agent: "CodeActAgent"
             embedding-model: "none"
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install poetry via pipx
-        run: pipx install poetry
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: ./.github/workflows/setup-environment.yml
         with:
-          python-version: '3.11'
-          cache: 'poetry'
-
-      - name: Install Python dependencies using Poetry
-        run: poetry install
-
-      - name: Build Environment
-        run: make build
-
+          operating-system: ubuntu-latest
+          install-docker: true
+          make-command: build
+          install-dependencies: true
       - name: Run Integration Tests
         env:
           SANDBOX_TYPE: ${{ matrix.sandbox }}
@@ -61,16 +50,6 @@ jobs:
           rm -rf workspace
           mkdir workspace
           WORKSPACE_BASE="$GITHUB_WORKSPACE/workspace" \
-            WORKSPACE_MOUNT_PATH="$GITHUB_WORKSPACE/workspace" \
-            poetry run pytest --cov=agenthub --cov=opendevin --cov-report=xml \
-            -s ./tests/integration
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-  test_matrix_success:
-    name: All Integration Tests Passed
-    runs-on: ubuntu-latest
-    needs: [integration-tests]
-    steps:
-    - run: echo Done!
+          WORKSPACE_MOUNT_PATH="$GITHUB_WORKSPACE/workspace" \
+          poetry run pytest --cov=agenthub --cov=opendevin --cov-report=xml \
+          -s ./tests/integration
