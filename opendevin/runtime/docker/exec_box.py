@@ -5,10 +5,11 @@ import sys
 import tarfile
 import time
 import uuid
-from collections import namedtuple
 from glob import glob
+from typing import Iterable
 
 import docker
+from docker.models.containers import Container, ExecResult
 
 from opendevin.core.config import config
 from opendevin.core.const.guide_url import TROUBLESHOOTING_URL
@@ -18,82 +19,13 @@ from opendevin.core.schema import CancellableStream
 from opendevin.runtime.docker.process import DockerProcess, Process
 from opendevin.runtime.sandbox import Sandbox
 
-ExecResult = namedtuple('ExecResult', 'exit_code,output')
-""" A result of Container.exec_run with the properties ``exit_code`` and
-    ``output``. """
-
-
-class DockerExecCancellableStream(CancellableStream):
-    # Reference: https://github.com/docker/docker-py/issues/1989
-    def __init__(self, _client, _id, _output):
-        super().__init__(self.read_output())
-        self._id = _id
-        self._client = _client
-        self._output = _output
-
-    def close(self):
-        self.closed = True
-
-    def exit_code(self):
-        return self.inspect()['ExitCode']
-
-    def inspect(self):
-        return self._client.api.exec_inspect(self._id)
-
-    def read_output(self):
-        for chunk in self._output:
-            yield chunk.decode('utf-8')
-
-
-def container_exec_run(
-    container,
-    cmd,
-    stdout=True,
-    stderr=True,
-    stdin=False,
-    tty=False,
-    privileged=False,
-    user='',
-    detach=False,
-    stream=False,
-    socket=False,
-    environment=None,
-    workdir=None,
-) -> ExecResult:
-    exec_id = container.client.api.exec_create(
-        container.id,
-        cmd,
-        stdout=stdout,
-        stderr=stderr,
-        stdin=stdin,
-        tty=tty,
-        privileged=privileged,
-        user=user,
-        environment=environment,
-        workdir=workdir,
-    )['Id']
-
-    output = container.client.api.exec_start(
-        exec_id, detach=detach, tty=tty, stream=stream, socket=socket
-    )
-
-    if stream:
-        return ExecResult(
-            None, DockerExecCancellableStream(container.client, exec_id, output)
-        )
-
-    if socket:
-        return ExecResult(None, output)
-
-    return ExecResult(container.client.api.exec_inspect(exec_id)['ExitCode'], output)
-
 
 class DockerExecBox(Sandbox):
     instance_id: str
     container_image: str
     container_name_prefix = 'opendevin-sandbox-'
     container_name: str
-    container: docker.models.containers.Container
+    container: Container
     docker_client: docker.DockerClient
 
     cur_background_id = 0
@@ -172,13 +104,71 @@ class DockerExecBox(Sandbox):
         bg_cmd = self.background_commands[id]
         return bg_cmd.read_logs()
 
+    def container_exec_run(
+        self,
+        cmd,
+        stdout=True,
+        stderr=True,
+        stdin=False,
+        tty=False,
+        privileged=False,
+        user='',
+        detach=False,
+        stream=False,
+        socket=False,
+        environment=None,
+        workdir=None,
+        demux=False,
+        timeout: int | None = None,
+    ):
+        timeout = timeout if timeout is not None else self.timeout
+
+        wrapper = f'timeout {self.timeout}s bash -c {shlex.quote(cmd)}'
+
+        resp = self.container.client.api.exec_create(
+            self.container.id,
+            wrapper,
+            stdout=stdout,
+            stderr=stderr,
+            stdin=stdin,
+            tty=tty,
+            privileged=privileged,
+            user=user,
+            environment=environment,
+            workdir=workdir,
+        )
+        exec_output = self.container.client.api.exec_start(resp['Id'], stream=stream)
+
+        def get_exit_code():
+            return self.container.client.api.exec_inspect(resp['Id'])['ExitCode']
+
+        if stream:
+            yield from self._handle_streaming(exec_output, get_exit_code)
+        else:
+            output = exec_output.decode('utf-8').rstrip('\n')
+            return ExecResult(get_exit_code(), output)
+
+    def _handle_streaming(self, exec_output: Iterable, get_exit_code):
+        output_lines = []
+        generator: Iterable = exec_output
+
+        for output in generator:
+            if output:
+                decoded_output = output.decode('utf-8')
+                output_lines.append(decoded_output)
+                yield decoded_output
+
+        final_output = ''.join(output_lines)
+        # We don't yield ExecResult in streaming mode to avoid duplicate output
+        return ExecResult(get_exit_code(), final_output)
+
     def execute(
         self, cmd: str, stream: bool = False, timeout: int | None = None
     ) -> tuple[int, str | CancellableStream]:
         timeout = timeout if timeout is not None else self.timeout
+
         wrapper = f'timeout {self.timeout}s bash -c {shlex.quote(cmd)}'
-        _exit_code, _output = container_exec_run(
-            self.container,
+        _exit_code, _output = self.container_exec_run(
             wrapper,
             stream=stream,
             workdir=self.sandbox_workspace_dir,
@@ -188,7 +178,6 @@ class DockerExecBox(Sandbox):
         if stream:
             return _exit_code, _output
 
-        print(_output)
         _output = _output.decode('utf-8')
         if _output.endswith('\n'):
             _output = _output[:-1]
@@ -333,7 +322,9 @@ class DockerExecBox(Sandbox):
                 break
             time.sleep(1)
             elapsed += 1
-            self.container = self.docker_client.containers.get(self.container_name)
+            self.container: Container = self.docker_client.containers.get(
+                self.container_name
+            )
             if elapsed > self.timeout:
                 break
         if self.container.status != 'running':
@@ -391,16 +382,22 @@ if __name__ == '__main__':
             except EOFError:
                 logger.info('Exiting...')
                 break
-            if user_input.lower() == 'exit':
+
+            if user_input.lower() in ['exit', 'kill']:
+                if user_input.lower() == 'kill':
+                    exec_box.kill_background(bg_cmd.pid)
+                    logger.info('Background process killed')
                 logger.info('Exiting...')
                 break
-            if user_input.lower() == 'kill':
-                exec_box.kill_background(bg_cmd.pid)
-                logger.info('Background process killed')
-                continue
-            exit_code, output = exec_box.execute(user_input)
-            logger.info('exit code: %d', exit_code)
-            logger.info(output)
+
+            for response_chunk in exec_box.container_exec_run(user_input, stream=True):
+                if isinstance(response_chunk, ExecResult):
+                    print(
+                        f'\nExit code: {response_chunk.exit_code}, Output: {response_chunk.output}'
+                    )
+                else:
+                    print(response_chunk, end='')
+
             if bg_cmd.pid in exec_box.background_commands:
                 logs = exec_box.read_logs(bg_cmd.pid)
                 logger.info('background logs: %s', logs)
